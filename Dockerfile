@@ -1,37 +1,58 @@
-# 阶段1: 构建前端
-FROM node:20-alpine AS builder
+# Build stage for frontend
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/web-app
 
-WORKDIR /app
+# Git is required for some dependencies pulled from repositories
+RUN apk add --no-cache git
 
-# 安装依赖
-COPY package.json yarn.lock ./
-RUN yarn install --frozen-lockfile
+# Install JS dependencies using BuildKit cache for faster subsequent builds
+COPY web-app/package.json web-app/yarn.lock ./
+RUN --mount=type=cache,target=/root/.cache/yarn \
+    corepack enable && corepack prepare yarn@4.4.0 --activate && yarn install --immutable
 
-# 拷贝源代码并构建
-COPY . .
+# Build React static assets
+COPY web-app/ ./
+RUN yarn install --immutable --check-cache
 RUN yarn build
 
-# 阶段2: 打包二进制 console
-FROM golang:1.23-alpine AS golang-builder
-
-WORKDIR /src
-
-# 安装构建依赖
-RUN apk add --no-cache make git bash
-
-COPY . .
-RUN make console
-
-# 阶段3: 最终运行镜像
-FROM alpine:3.19
-
+# Build stage for backend
+FROM golang:1.23-alpine AS backend-builder
 WORKDIR /app
 
-# 拷贝编译好的二进制
-COPY --from=golang-builder /src/console /usr/local/bin/console
-# 拷贝前端构建产物（假设 build 目录存放在 dist）
-COPY --from=builder /app/dist /app/dist
+# Download Go modules using cache layer
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download -x
+
+# Copy the rest of the source code (excluding /web-app/build which isn't present yet)
+COPY . .
+
+# Bring in the pre-built frontend assets and embed them
+COPY --from=frontend-builder /app/web-app/build ./web-app/build
+
+# Produce a fully static binary
+RUN CGO_ENABLED=0 GOOS=linux \
+    go build -trimpath --tags=kqueue --ldflags "-s -w" -o console ./cmd/console
+
+# -------- Runtime stage --------
+FROM alpine:latest
+
+# Add certificates and create an unprivileged user
+RUN apk --no-cache add ca-certificates \
+    && addgroup -S console && adduser -S console -G console
+
+WORKDIR /home/console
+
+# Copy the statically-linked binary
+COPY --from=backend-builder /app/console ./
+
+# Switch to non-root user for better security
+USER console
 
 EXPOSE 9090
 
-ENTRYPOINT ["console", "server", "--port", "9090"]
+# Basic healthcheck — adjust path if your server exposes another endpoint
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s CMD wget -qO- http://127.0.0.1:9090/health || exit 1
+
+
+CMD ["./console", "server"]
